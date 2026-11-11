@@ -1,0 +1,421 @@
+//! Persistent configuration stored as TOML.
+//!
+//! [`Config::load`] reads `config.toml` from the platform config directory
+//! (the same directory that [`crate::store::Store`] uses for favorites and
+//! recents), returning [`Config::default`] when the file does not exist yet.
+//! CLI arguments always take precedence over stored values.
+//!
+//! **Security note:** Xtream credentials are written in plaintext. Persistent
+//! files are protected by the user's filesystem access controls and use mode
+//! `0600` on Unix, but they are not encrypted.
+
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::private_file;
+
+const CONFIG_FILE: &str = "config.toml";
+
+/// Top-level configuration file structure.
+///
+/// # Example
+///
+/// ```
+/// use m3u_viewer::config::Config;
+///
+/// let config = Config::default()
+///     .with_regex_filter(false)
+///     .with_vlc_reuse_instance(true);
+///
+/// assert!(!config.regex_filter());
+/// assert!(config.vlc_reuse_instance());
+/// ```
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Config {
+    /// Stored Xtream Codes account credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) xtream: Option<XtreamConfig>,
+    /// Path to the VLC executable, overriding auto-detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) vlc_path: Option<PathBuf>,
+    /// `User-Agent` header for Xtream requests; some providers only
+    /// answer to known player user agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) user_agent: Option<String>,
+    /// XMLTV guide source (HTTP(S) URL or file path) used when `--epg` is
+    /// not given on the command line. Takes precedence over a `url-tvg`
+    /// header and the Xtream account's own guide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) epg_url: Option<String>,
+    /// Whether the channel filter (`/`) treats its input as a regular
+    /// expression, falling back to plain substring matching when the
+    /// pattern fails to compile. Enabled by default; set to `false` to
+    /// always use plain substring matching.
+    #[serde(default = "default_regex_filter")]
+    pub(crate) regex_filter: bool,
+    /// Whether playing a channel reuses a single running VLC instance
+    /// (via `--one-instance`) instead of opening a new window per channel.
+    /// Disabled by default.
+    #[serde(default)]
+    pub(crate) vlc_reuse_instance: bool,
+    /// Whether to read VLC's plugins into the OS file cache at startup so
+    /// the first playback is not delayed by a cold disk. Enabled by
+    /// default; set to `false` to skip the background reads.
+    #[serde(default = "default_vlc_prewarm")]
+    pub(crate) vlc_prewarm: bool,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("xtream", &self.xtream)
+            .field("vlc_path", &self.vlc_path)
+            .field("user_agent", &self.user_agent)
+            .field("epg_url", &self.epg_url.as_ref().map(|_| "<redacted URL>"))
+            .field("regex_filter", &self.regex_filter)
+            .field("vlc_reuse_instance", &self.vlc_reuse_instance)
+            .field("vlc_prewarm", &self.vlc_prewarm)
+            .finish()
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            xtream: None,
+            vlc_path: None,
+            user_agent: None,
+            epg_url: None,
+            regex_filter: default_regex_filter(),
+            vlc_reuse_instance: false,
+            vlc_prewarm: default_vlc_prewarm(),
+        }
+    }
+}
+
+fn default_regex_filter() -> bool {
+    true
+}
+
+fn default_vlc_prewarm() -> bool {
+    true
+}
+
+/// Xtream Codes credentials stored in the config file.
+///
+/// Not `Debug`-derived to prevent accidental password exposure in logs or
+/// error messages.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct XtreamConfig {
+    /// Provider base URL, e.g. `http://provider.example:8080`.
+    server: String,
+    /// Account username.
+    username: String,
+    /// Account password (stored in plaintext).
+    password: String,
+}
+
+impl fmt::Debug for XtreamConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("XtreamConfig")
+            .field("server", &self.server)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Errors that can occur while loading or saving the config file.
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    /// Reading the config file failed.
+    #[error("could not read config: {0}")]
+    Read(#[from] std::io::Error),
+    /// The config file is not valid TOML.
+    #[error("could not parse config: {0}")]
+    Parse(#[from] toml::de::Error),
+    /// Writing the config file failed.
+    #[error("could not save config: {0}")]
+    Write(String),
+}
+
+impl Config {
+    /// Sets the persisted Xtream account.
+    #[must_use]
+    pub fn with_xtream(mut self, xtream: Option<XtreamConfig>) -> Self {
+        self.xtream = xtream;
+        self
+    }
+
+    /// Sets the VLC executable override.
+    #[must_use]
+    pub fn with_vlc_path(mut self, vlc_path: Option<PathBuf>) -> Self {
+        self.vlc_path = vlc_path;
+        self
+    }
+
+    /// Sets the HTTP user agent.
+    #[must_use]
+    pub fn with_user_agent(mut self, user_agent: Option<String>) -> Self {
+        self.user_agent = user_agent;
+        self
+    }
+
+    /// Sets the EPG source.
+    #[must_use]
+    pub fn with_epg_url(mut self, epg_url: Option<String>) -> Self {
+        self.epg_url = epg_url;
+        self
+    }
+
+    /// Sets whether channel filters use regular expressions.
+    #[must_use]
+    pub fn with_regex_filter(mut self, enabled: bool) -> Self {
+        self.regex_filter = enabled;
+        self
+    }
+
+    /// Sets whether VLC playback reuses one running instance.
+    #[must_use]
+    pub fn with_vlc_reuse_instance(mut self, enabled: bool) -> Self {
+        self.vlc_reuse_instance = enabled;
+        self
+    }
+
+    /// Sets whether VLC's plugins are read into the file cache at startup.
+    #[must_use]
+    pub fn with_vlc_prewarm(mut self, enabled: bool) -> Self {
+        self.vlc_prewarm = enabled;
+        self
+    }
+
+    /// Stored Xtream account, when configured.
+    #[must_use]
+    pub fn xtream(&self) -> Option<&XtreamConfig> {
+        self.xtream.as_ref()
+    }
+
+    /// Configured VLC executable path.
+    #[must_use]
+    pub fn vlc_path(&self) -> Option<&Path> {
+        self.vlc_path.as_deref()
+    }
+
+    /// Configured HTTP user agent.
+    #[must_use]
+    pub fn user_agent(&self) -> Option<&str> {
+        self.user_agent.as_deref()
+    }
+
+    /// Configured EPG source.
+    #[must_use]
+    pub fn epg_url(&self) -> Option<&str> {
+        self.epg_url.as_deref()
+    }
+
+    /// Whether channel filters use regular expressions.
+    #[must_use]
+    pub fn regex_filter(&self) -> bool {
+        self.regex_filter
+    }
+
+    /// Whether VLC playback reuses one running instance.
+    #[must_use]
+    pub fn vlc_reuse_instance(&self) -> bool {
+        self.vlc_reuse_instance
+    }
+
+    /// Whether VLC's plugins are read into the file cache at startup.
+    #[must_use]
+    pub fn vlc_prewarm(&self) -> bool {
+        self.vlc_prewarm
+    }
+
+    /// Loads config from `path`, returning [`Config::default`] when the file
+    /// does not exist.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError`] if the file exists but cannot be read or parsed.
+    #[must_use = "the loaded config is not used"]
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+
+        let text = private_file::read_to_string(path)?;
+        Ok(toml::from_str(&text)?)
+    }
+
+    /// Saves the config to `path` atomically (temp file → rename).
+    ///
+    /// The parent directory is created if it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Write`] if serialisation or any I/O step fails.
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        let text = toml::to_string_pretty(self).map_err(|e| ConfigError::Write(e.to_string()))?;
+        if let Some(parent) = path.parent() {
+            private_file::create_dir_all(parent).map_err(|e| ConfigError::Write(e.to_string()))?;
+        }
+        private_file::atomic_write(path, text.as_bytes())
+            .map_err(|error| ConfigError::Write(error.to_string()))
+    }
+
+    /// Returns the default config file path, or `None` on platforms without a
+    /// per-user config directory.
+    #[must_use]
+    pub fn default_path() -> Option<PathBuf> {
+        directories::ProjectDirs::from("", "", "m3u-viewer")
+            .map(|dirs| dirs.config_dir().join(CONFIG_FILE))
+    }
+}
+
+impl XtreamConfig {
+    /// Creates persisted Xtream credentials.
+    #[must_use]
+    pub fn new(server: String, username: String, password: String) -> Self {
+        Self {
+            server,
+            username,
+            password,
+        }
+    }
+
+    /// Provider base URL.
+    #[must_use]
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    /// Account username.
+    #[must_use]
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    /// Account password.
+    #[must_use]
+    pub fn password(&self) -> &str {
+        &self.password
+    }
+}
+
+#[cfg(test)]
+// unwrap is fine in tests (see AGENTS.md).
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    fn temp_path(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("m3u-viewer-config-{tag}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join(CONFIG_FILE)
+    }
+
+    #[test]
+    fn round_trip_xtream_and_vlc() {
+        let path = temp_path("rt");
+        let config = Config {
+            xtream: Some(XtreamConfig {
+                server: "http://example.com:8080".to_owned(),
+                username: "user".to_owned(),
+                password: "s3cr3t".to_owned(),
+            }),
+            vlc_path: Some(PathBuf::from("/usr/bin/vlc")),
+            user_agent: Some("VLC/3.0.20".to_owned()),
+            epg_url: Some("http://example.com/epg.xml.gz".to_owned()),
+            regex_filter: false,
+            vlc_reuse_instance: true,
+            vlc_prewarm: false,
+        };
+        config.save(&path).unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        let xtream = loaded.xtream.unwrap();
+        assert_eq!(xtream.server, "http://example.com:8080");
+        assert_eq!(xtream.username, "user");
+        assert_eq!(xtream.password, "s3cr3t");
+        assert_eq!(loaded.vlc_path, Some(PathBuf::from("/usr/bin/vlc")));
+        assert_eq!(loaded.user_agent, Some("VLC/3.0.20".to_owned()));
+        assert_eq!(
+            loaded.epg_url,
+            Some("http://example.com/epg.xml.gz".to_owned())
+        );
+        assert!(!loaded.regex_filter);
+        assert!(!loaded.vlc_prewarm);
+        assert!(loaded.vlc_reuse_instance);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn missing_file_returns_default() {
+        let path = std::env::temp_dir().join("m3u-viewer-config-nonexistent-99999.toml");
+        let config = Config::load(&path).unwrap();
+        assert!(config.xtream.is_none());
+        assert!(config.vlc_path.is_none());
+        assert!(config.regex_filter);
+        assert!(!config.vlc_reuse_instance);
+    }
+
+    #[test]
+    fn corrupt_file_returns_error() {
+        let path = temp_path("corrupt");
+        fs::write(&path, "not valid toml [[[").unwrap();
+        assert!(Config::load(&path).is_err());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn partial_config_round_trips() {
+        let path = temp_path("partial");
+        let config = Config {
+            vlc_path: Some(PathBuf::from("C:/tools/vlc.exe")),
+            ..Config::default()
+        };
+        config.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.xtream.is_none());
+        assert_eq!(loaded.vlc_path, Some(PathBuf::from("C:/tools/vlc.exe")));
+        assert!(loaded.user_agent.is_none());
+        assert!(loaded.epg_url.is_none());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn config_written_before_vlc_reuse_instance_existed_defaults_to_disabled() {
+        let path = temp_path("pre-reuse-instance");
+        fs::write(&path, "vlc_path = \"/usr/bin/vlc\"\n").unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(!loaded.vlc_reuse_instance);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn config_written_before_regex_filter_existed_defaults_to_enabled() {
+        let path = temp_path("pre-regex");
+        fs::write(&path, "vlc_path = \"/usr/bin/vlc\"\n").unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.regex_filter);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn config_written_before_vlc_prewarm_existed_defaults_to_enabled() {
+        let path = temp_path("pre-prewarm");
+        fs::write(&path, "vlc_path = \"/usr/bin/vlc\"\n").unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.vlc_prewarm);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+}

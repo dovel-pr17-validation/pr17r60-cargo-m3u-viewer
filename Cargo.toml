@@ -1,0 +1,50 @@
+[package]
+name = "m3u-viewer"
+version = "0.9.5"
+edition = "2024"
+description = "Fast terminal viewer for large M3U playlists"
+license = "Apache-2.0"
+repository = "https://github.com/jvonscheidt/m3u-viewer"
+keywords = ["m3u", "iptv", "playlist", "tui", "vlc"]
+categories = ["command-line-utilities", "multimedia"]
+
+[dependencies]
+anyhow = "1.0.103"
+chrono = "0.4.42"
+directories = "6.0.0"
+flate2 = "1.1.5"
+log = "0.4.33"
+percent-encoding = "2.3.2"
+quick-xml = "0.41.0"
+ratatui = "0.30.2"
+regex = "1.12.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+simplelog = "0.12.2"
+thiserror = "2.0.18"
+toml = "1.1.2"
+ureq = "3.3.0"
+
+# Only for WaitForInputIdle, which times how long VLC takes to finish
+# initialising; already in the lock tree via crossterm, so no new build.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
+
+[dev-dependencies]
+criterion = "0.5.1"
+
+[[bench]]
+name = "absorb"
+harness = false
+
+[lints.rust]
+# "warn", not "forbid": the VLC startup metric needs one WaitForInputIdle
+# call, which has no safe equivalent in std. Every other use stays denied
+# by review — each #[allow(unsafe_code)] must carry a justification.
+unsafe_code = "warn"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"

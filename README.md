@@ -1,0 +1,389 @@
+# m3u-viewer
+
+A fast terminal viewer for large M3U/M3U8 playlists, written in Rust.
+Browse, filter, and play IPTV channel lists that are far too big for a
+text editor — smoothly, even at 100 MB.
+
+## Installation
+
+On Windows, install with [WinGet](https://learn.microsoft.com/windows/package-manager/winget/):
+
+```console
+winget install --id jvonscheidt.m3u-viewer --exact
+```
+
+Prebuilt archives for Windows, Linux, and macOS are attached to each
+[GitHub release](https://github.com/jvonscheidt/m3u-viewer/releases).
+Each archive contains the binary, `README.md`, and `LICENSE`. To verify a
+download, check it against the release's `SHA256SUMS` file:
+
+```console
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+## Usage
+
+### Build & run
+
+Requires [Rust](https://rustup.rs) 1.99.0 (pinned via
+`rust-toolchain.toml`; rustup installs it automatically) and, for
+playback, [VLC](https://www.videolan.org).
+
+```console
+$ cargo build --release
+$ ./target/release/m3u-viewer <playlist.m3u>
+```
+
+Or directly:
+
+```console
+$ cargo run --release -- <playlist.m3u>
+```
+
+The UI opens immediately; large files keep loading in the background
+while you browse (progress shows in the status bar).
+
+### Command line
+
+```
+m3u-viewer <playlist.m3u> [--epg <url-or-file>] [--vlc <path>] [--vlc-reuse-instance]
+m3u-viewer --xtream <server> --username <user> --password <pass> [--epg <url-or-file>] [--user-agent <ua>] [--vlc <path>] [--vlc-reuse-instance] [--save-config]
+m3u-viewer [--vlc <path>]   (with saved Xtream credentials)
+m3u-viewer --help | --version
+```
+
+- `<playlist.m3u>` — the playlist to open (`.m3u` or `.m3u8`). UTF-8 is
+  expected; lines that aren't valid UTF-8 are read as Windows-1252
+  (a superset of Latin-1) instead of aborting the load.
+- `--xtream <server>` — instead of a file, load the playlist of an
+  Xtream Codes account. `<server>` is the provider's base URL (e.g.
+  `http://provider.example:8080`; `http://` is assumed if omitted).
+  Requires `--username` and `--password`. The playlist is downloaded via
+  the account's `get.php` endpoint and streams into the viewer while it
+  arrives. If the provider has disabled the M3U download (some panels
+  block `get.php` entirely), the live channel list is fetched through
+  the Xtream player API (`player_api.php`) instead, with categories as
+  groups; entries the panel sends incomplete (no usable stream id, nulls)
+  are skipped and counted in the log rather than failing the whole list.
+  Slow downloads are never cut off while data keeps arriving; a server
+  that stops sending for 30 s fails the load. If a download fails after
+  the server redirected it to a different host, the error names that
+  host — usually a sign of DNS filtering or spoofing on your network.
+  Note that the credentials are visible in your shell history and
+  process list.
+- `--epg <url-or-file>` — load an [XMLTV](https://wiki.xmltv.org)
+  programme guide (plain or gzipped) and show what's airing now and
+  next. Usually unnecessary: playlists that name a guide in their
+  `#EXTM3U url-tvg="…"` header and Xtream accounts (via `xmltv.php`)
+  get EPG automatically; this flag overrides both. Can also be set as
+  `epg_url` in `config.toml`; the CLI value wins.
+- `--user-agent <ua>` — send this `User-Agent` header when downloading
+  the playlist from the Xtream server. Some providers only answer to
+  known player user agents, e.g. `--user-agent "VLC/3.0.20 LibVLC/3.0.20"`.
+  Can also be set as `user_agent` in `config.toml`; the CLI value wins.
+- `--save-config` — write the Xtream credentials, the user agent, the
+  EPG source, and the VLC path (if given) to `config.toml` in the
+  config directory so you can omit them on future invocations. Run
+  once; then `m3u-viewer` with no arguments picks up the saved
+  credentials automatically. The file is created if it does not exist
+  yet. An existing `config.toml` that cannot be read or parsed is never
+  overwritten: `--save-config` then stops with the parse error so you
+  can fix or delete the file (without the flag, the viewer starts on
+  defaults and says so in the status bar).
+- `--vlc <path>` — use this VLC executable instead of auto-detection.
+  Without it, `vlc` is looked up on `PATH`, then in the standard install
+  locations (e.g. `C:\Program Files\VideoLAN\VLC` on Windows,
+  `/Applications/VLC.app` on macOS).
+- `--vlc-reuse-instance` — play channels in a single running VLC window
+  (VLC's `--one-instance`) instead of opening a new window per channel.
+  Can also be set as `vlc_reuse_instance = true` in `config.toml`.
+- `--help`, `-h` — print usage information and exit.
+- `--version`, `-V` — print the application version and exit.
+
+On startup, VLC's plugins are read into the operating system's file cache
+on a background thread, so the first channel you play does not wait for
+them to come off disk. The first launch after a reboot is where this
+matters: measured on Windows it took ~10.7 s to reach a playable VLC cold
+against ~0.3 s warm, almost all of it disk reads and the on-access virus
+scan rather than VLC itself. Set `vlc_prewarm = false` in `config.toml`
+to skip it.
+
+### Programme guide (EPG)
+
+When a guide is available — from `--epg`, the playlist's
+`url-tvg` header, or the Xtream account itself — the channel list
+gains a "now playing" column, and a line above the status bar shows
+now/next with times for the selected channel:
+
+```
+▶ 20:15–21:45 Breaking Stories & More  ·  next 21:45 Late Review
+```
+
+Channels are matched by `tvg-id`, falling back to the channel name.
+The guide loads in the background (`epg…` in the status bar; `epg ✗`
+plus a log entry if it fails) and never blocks browsing. Broken markup
+or a download that breaks off midway keeps every programme read up to
+that point. Only a 12-hour window around "now" is kept, so even
+multi-day guides for huge playlists stay cheap. `e` hides/shows the EPG
+display.
+
+### Filtering
+
+`/` filters as you type; a channel matches when the pattern matches
+its name or its group (each checked on its own). The pattern is a
+case-insensitive [regular expression](https://docs.rs/regex/latest/regex/#syntax)
+— `bbc|cnn` matches either channel, `^sky sports` anchors at the
+start of the name (or group), `hd$` at its end. Text that doesn't
+(yet) compile as a regex — usually a pattern you're still typing —
+falls back to a plain substring match instead of showing "no
+matches", and the status bar says so. Set
+`regex_filter = false` in `config.toml` to always match literally
+(then `ESPN+` finds only `ESPN+`).
+
+### Keys at a glance
+
+Press `?` inside the viewer for the full list. The essentials:
+
+| Key | Action |
+| --- | --- |
+| `/` + text | filter channels as you type (regex) |
+| `g` | restrict to one group (searchable selector) |
+| `Enter` | play the selected channel in VLC |
+| `f` | mark/unmark as favorite (`★`) |
+| `F` / `R` / `Tab` | favorites view / recents view / cycle views |
+| `e` | toggle the EPG display |
+| `Esc` | clear filter and group |
+| `q` | quit |
+
+### Where your data lives
+
+Settings and lists live in the per-user config directory — on Windows
+`%APPDATA%\m3u-viewer\config\`, on Linux `~/.config/m3u-viewer/`, on
+macOS `~/Library/Application Support/m3u-viewer/`.
+
+| File | Contents |
+| --- | --- |
+| `config.toml` | Xtream credentials, user agent, EPG source, and VLC path (written by `--save-config`); hand-edited toggles like `regex_filter`, `vlc_reuse_instance`, and `vlc_prewarm` |
+| `favorites.json` | Favorited channel URLs |
+| `recents.json` | Recently played channel URLs (newest first, capped at 50) |
+| `m3u-viewer.log` | Diagnostic log (startup, loading, playback timings); appended across runs and rotated to `m3u-viewer.log.old` once it spans 30 days (if that file is locked, the log keeps appending; a log that cannot be opened never stops the viewer) |
+
+The Xtream playlist cache lives in the per-user cache directory instead, so
+its tens of megabytes are never synced with a roaming profile — on Windows
+`%LOCALAPPDATA%\m3u-viewer\cache\`, on Linux `~/.cache/m3u-viewer/` (or
+`$XDG_CACHE_HOME/m3u-viewer/`), on macOS `~/Library/Caches/m3u-viewer/`.
+
+| File | Contents |
+| --- | --- |
+| `xtream-*.m3u` | Last successfully downloaded Xtream playlist per account, shown instantly on the next launch while the live refresh runs. If the refresh fails, the cached list stays on screen with a warning above the status bar. After a password change, the first successful refresh deletes the account's cache from the old password |
+| `xtream-*.m3u.tmp.*` | Playlist being downloaded; replaces the cached copy once complete. Left behind if the viewer quits or crashes mid-download, and deleted by the next launch that loads an Xtream playlist (never while another running viewer is still writing it) |
+
+Up to 0.9.1 the cache was kept in a `cache\` subdirectory of the config
+directory; the first Xtream load with a newer version deletes the playlists
+there (they are re-downloaded, not moved) and leaves the rest of the config
+directory alone.
+
+Favorites and recents are keyed by stream URL, so they survive playlist
+re-downloads and re-ordering. **Xtream credentials are stored in plaintext**
+in `config.toml` and in stream URLs inside the cache, favorites, and recents
+files. These files are protected by the user account's filesystem access
+controls (and created with mode `0600` on Unix), but they are not encrypted.
+Deleting both directories resets everything; deleting only the cache
+directory just makes the next launch download the playlist live.
+
+## Specification
+
+### Goals
+
+- Open M3U files **up to 100 MB** (roughly 500k–1M entries) and stay
+  responsive throughout.
+- Instant, as-you-type filtering over the full playlist.
+- One-keystroke playback of the selected channel in **VLC**.
+- Persistent **favorites** and **recently played** lists across sessions.
+
+### Non-goals
+
+- Editing or saving playlists (read-only viewer).
+- Built-in media playback — VLC is the player.
+- Non-M3U playlist formats (XSPF, PLS).
+- Video on demand (VoD): Xtream VOD/series catalogs are not fetched —
+  live streams only. (VoD entries already present in an M3U file are
+  listed like any other channel.)
+
+### Functional requirements
+
+#### Loading & parsing
+
+- Invocation: `m3u-viewer <playlist.m3u>`; also accepts `.m3u8`.
+- Encoding (since 0.9.1): UTF-8; lines that aren't valid UTF-8 (typical
+  of Latin-1 / Windows-1252 playlists) are decoded as Windows-1252 rather
+  than failing the load.
+- Alternative source (since 0.2.0): `--xtream <server> --username <u>
+  --password <p>` downloads the account playlist over HTTP
+  (`get.php?type=m3u_plus`) and streams it through the same parser;
+  progress is indeterminate when the server does not announce a
+  content length.
+- Config file (since 0.3.0): `--save-config` persists Xtream credentials
+  and the VLC path to `config.toml` in the platform config directory;
+  subsequent invocations with no arguments use the saved values
+  automatically. CLI arguments always take precedence over config. The
+  file stores credentials in plaintext.
+- Parses `#EXTINF` metadata: channel name, `tvg-id`, `tvg-logo` (ignored),
+  `group-title`, and the stream URL on the following line.
+- Malformed entries are skipped, counted, and reported in the status bar —
+  a bad line must never abort loading.
+- Xtream cache (since 0.9.1): the cached copy is keyed on the account's
+  server, username, and password, so a changed password never reuses
+  stream URLs carrying the old one. (Upgrading from an earlier version
+  re-keys the cache once, so the first launch loads live.) A failed
+  live refresh keeps the cached list on screen and says so above the
+  status bar, with any password masked in the message.
+- Network timeouts (since 0.9.1): 10 s to connect, 60 s for the server to
+  start answering, and 30 s without data mid-download; a download that
+  keeps progressing is never cut off (1 h hard cap).
+- Player API (since 0.9.2): lists are parsed record by record and
+  streamed rather than built as one JSON tree; records without a usable
+  id are skipped and counted, and lists keyed by id instead of arrays
+  are accepted.
+- Redirects (since 0.9.2): up to 3 are followed, each logged by scheme
+  and host only. When one leads to a different host and the request then
+  fails, the error leads with that host and a hint that DNS filtering or
+  spoofing is the likely cause.
+- Failures stay visible and non-fatal (since 0.9.2): a loader or EPG
+  thread that dies is reported instead of leaving "loading" on screen;
+  a missing console is an error message, not a crash; log problems never
+  stop the viewer; and the UI keeps responding during huge loads (each
+  frame applies only a bounded slice of the incoming batches).
+- Parsing runs on a background thread; the UI appears immediately and fills
+  in as entries stream in, with a progress indicator until the file is
+  fully loaded.
+
+#### Browsing & filtering
+
+- Main view: a scrollable channel list (virtualized — only visible rows are
+  rendered) showing channel name and group, sorted alphabetically
+  (case-insensitive) rather than playlist order — including while a large
+  playlist is still streaming in.
+- `/` opens a filter prompt; a channel matches if its name or its group
+  matches (checked separately, so a pattern never spans both),
+  updated on every keystroke (debounced ≤ 50 ms).
+- Filter syntax (since 0.5.0): the text is a case-insensitive regular
+  expression; input that fails to compile (typically a half-typed
+  pattern) degrades to a case-insensitive substring match rather than
+  an empty list, with an indicator in the status bar. `regex_filter =
+  false` in `config.toml` forces literal substring matching.
+- Group selector: jump to or restrict the list to one `group-title`;
+  groups are listed alphabetically too. Searchable since 0.7.0 — inside
+  the selector, `/` filters the group list as you type and
+  `PgUp`/`PgDn`/`Home`/`End` page through it, for accounts with hundreds
+  of groups.
+- Filter and group restriction combine (AND).
+- Load errors and warnings (since 0.9.2) show in a band above the status
+  bar, word-wrapped over up to three rows; longer text ends in
+  "… (see log)". The status bar keeps counts, tags, and key hints.
+
+#### Programme guide (EPG, since 0.6.0)
+
+- XMLTV source resolution, in order: `--epg <url-or-file>` (or
+  `epg_url` in `config.toml`), the playlist's `#EXTM3U url-tvg` /
+  `x-tvg-url` header, and — for Xtream accounts — the panel's
+  `xmltv.php` endpoint. Gzipped feeds are detected by content, not
+  file name.
+- The guide loads and parses on a background thread; failures surface
+  as a status-bar marker plus a log entry, never as an aborted start.
+- Channels are matched by `tvg-id` first, then by display name
+  (case-insensitive). The list shows the current programme per
+  channel; a dedicated line shows now/next with times for the
+  selection.
+- Only programmes within a 12-hour window around load time are kept,
+  bounding memory even for multi-day guides over very large playlists.
+- Encoding (since 0.9.1): feeds declaring ISO-8859-1 / Latin-1 /
+  Windows-1252 are decoded as Windows-1252; otherwise UTF-8, with an
+  invalid byte replaced rather than discarding the whole guide.
+- Tolerance (since 0.9.2): mismatched or unclosed tags and bare `&` are
+  accepted, a truncated document keeps everything parsed before the cut,
+  concatenated (multi-member) gzip feeds are read in full, and
+  timestamps may omit the space before the offset
+  (`20240101120000+0100`).
+- `e` toggles the EPG display without discarding the loaded guide.
+
+#### Playback (VLC)
+
+- `Enter` launches the selected channel's URL in VLC as a detached
+  process; the viewer stays open.
+- Only network stream URLs are launched (since 0.9.1): `http`, `https`,
+  `rtsp`, `rtsps`, `rtmp`, `rtmps`, `rtp`, `udp`, `mms`, `mmsh`, and
+  `srt`. Anything else — local file paths, `file:`/`smb:` URLs, network
+  share (UNC) paths, or lines starting with `-` — is refused with a
+  status-bar message, so a hostile playlist can't pass options to VLC
+  or make Windows connect to a remote file share.
+- VLC discovery: `vlc` on `PATH`, standard install locations per OS
+  (e.g. `C:\Program Files\VideoLAN\VLC\vlc.exe` on Windows), overridable
+  via config file or `--vlc <path>`.
+- If VLC cannot be found or spawned, show a non-blocking error in the
+  status bar.
+
+#### Favorites
+
+- `f` toggles favorite on the selected channel; favorites are marked
+  (e.g. `★`) in the list.
+- A favorites view (`F`) lists only favorites.
+- Persisted by channel URL (survives playlist re-ordering) in the platform
+  config directory (e.g. `%APPDATA%\m3u-viewer\config\favorites.json`).
+
+#### Recent channels
+
+- Every successful playback prepends the channel to a recents list
+  (deduplicated, capped at 50).
+- A recents view (`R`) lists them newest-first; persisted alongside
+  favorites.
+
+### Key bindings
+
+| Key | Action |
+| --- | --- |
+| `↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End` | Navigate list |
+| `Enter` | Play in VLC |
+| `/` | Filter (type to narrow, `Esc` clears) |
+| `g` | Group selector |
+| `f` | Toggle favorite |
+| `F` | Favorites view |
+| `R` | Recent channels view |
+| `Tab` | Cycle views: all / favorites / recents |
+| `e` | Toggle EPG display |
+| `?` | Help overlay |
+| `q` | Quit |
+
+Inside the group selector (`g`): `/` searches the group list,
+`↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End` move through it (also between
+matches while searching), `Enter` selects, and `Esc` ends the search
+(keeping the highlighted group) or closes the selector.
+
+### Performance targets (100 MB playlist)
+
+| Metric | Target |
+| --- | --- |
+| Time to interactive UI | < 200 ms |
+| Full background parse | < 3 s |
+| Keystroke-to-filter-result | < 100 ms |
+| Scrolling | no perceptible lag (60 fps redraw budget) |
+| Memory | < 4× file size resident |
+
+### Architecture
+
+- **Language/UI:** Rust with [ratatui](https://ratatui.rs) +
+  crossterm (cross-platform terminal backend).
+- **Parser:** single-pass streaming parser over a buffered reader;
+  entries stored in a flat `Vec<Channel>` with interned group names.
+- **Filtering:** background search over the in-memory vector; results are
+  index lists into the main vector, so no entry data is copied.
+- **State:** favorites/recents as small JSON files in the platform config
+  dir (`directories` crate); written atomically on change.
+- **Playback:** `std::process::Command` spawn, detached, stdout/stderr
+  discarded.
+
+### Future ideas (out of scope for v1)
+
+- Stream health check (probe URLs, flag dead streams).
+- Export marked channels as a new, smaller M3U.
+- mpv as an alternative player.
